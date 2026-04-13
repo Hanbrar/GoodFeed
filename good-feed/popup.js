@@ -34,18 +34,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const currentMode = getSelectedMode();
 
-    setFeedBtn.disabled = true;
-    setFeedBtn.textContent = 'Setting…';
-
+    // Save to storage first, then broadcast — injection happens in the background.
     await chrome.storage.local.set({ intent: newIntent, active: true, mode: currentMode });
-    renderStatus(true, newIntent);
     broadcastToXTabs({ action: 'updateIntent', intent: newIntent, active: true, mode: currentMode });
 
-    setFeedBtn.textContent = 'Feed Set!';
-    setTimeout(() => {
-      setFeedBtn.textContent = 'Set My Feed';
-      setFeedBtn.disabled = false;
-    }, 1500);
+    // Close the popup immediately so the user sees their feed update.
+    window.close();
   });
 
   intentInput.addEventListener('keydown', e => {

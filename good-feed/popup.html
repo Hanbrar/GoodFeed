@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Good Feed</title>
+  <link rel="stylesheet" href="styles/popup.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <span class="logo-mark">✦</span>
+      <span class="logo-text">Good Feed</span>
+    </header>
+
+    <main class="main">
+      <label class="input-label" for="intentInput">
+        What should your feed be about?
+      </label>
+      <input
+        id="intentInput"
+        class="intent-input"
+        type="text"
+        placeholder="e.g. Claude Opus 4.6"
+        autocomplete="off"
+        spellcheck="false"
+      >
+      <button id="setFeedBtn" class="btn-primary">Set My Feed</button>
+    </main>
+
+    <footer class="status-section" id="statusSection">
+      <div class="status-row">
+        <span id="statusDot" class="status-dot"></span>
+        <span id="statusText" class="status-text">Inactive</span>
+      </div>
+      <button id="toggleBtn" class="btn-secondary">Enable</button>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

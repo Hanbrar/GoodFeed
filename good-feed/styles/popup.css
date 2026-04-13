@@ -1,0 +1,173 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  width: 320px;
+  background: #0f0f0f;
+  color: #e7e9ea;
+  font-family: 'DM Mono', ui-monospace, 'Cascadia Code', monospace;
+  -webkit-font-smoothing: antialiased;
+}
+
+.container {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+/* ── Header ── */
+.header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid #1e1e1e;
+}
+
+.logo-mark {
+  color: #1d9bf0;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.logo-text {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #e7e9ea;
+}
+
+/* ── Main input area ── */
+.main {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 18px 20px;
+}
+
+.input-label {
+  font-size: 12px;
+  color: #71767b;
+  letter-spacing: 0.02em;
+  line-height: 1.4;
+}
+
+.intent-input {
+  width: 100%;
+  padding: 10px 12px;
+  background: #161616;
+  border: 1px solid #2f3336;
+  border-radius: 8px;
+  color: #e7e9ea;
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.intent-input::placeholder {
+  color: #3d4349;
+}
+
+.intent-input:focus {
+  border-color: #1d9bf0;
+}
+
+.btn-primary {
+  width: 100%;
+  padding: 11px;
+  background: #1d9bf0;
+  border: none;
+  border-radius: 9999px;
+  color: #fff;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  letter-spacing: 0.01em;
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.btn-primary:hover {
+  background: #1a8cd8;
+}
+
+.btn-primary:active {
+  transform: scale(0.98);
+}
+
+.btn-primary:disabled {
+  background: #0e4c76;
+  cursor: not-allowed;
+}
+
+/* ── Status footer ── */
+.status-section {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px 18px;
+  border-top: 1px solid #1e1e1e;
+}
+
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  flex: 1;
+  margin-right: 12px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #3d4349;
+  flex-shrink: 0;
+  transition: background 0.2s ease;
+}
+
+.status-dot.active {
+  background: #1d9bf0;
+  box-shadow: 0 0 6px rgba(29, 155, 240, 0.6);
+}
+
+.status-text {
+  font-size: 12px;
+  color: #71767b;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.status-text.active {
+  color: #e7e9ea;
+}
+
+.btn-secondary {
+  flex-shrink: 0;
+  padding: 7px 14px;
+  background: transparent;
+  border: 1px solid #2f3336;
+  border-radius: 9999px;
+  color: #e7e9ea;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: #536471;
+}
+
+.btn-secondary.disable-btn {
+  border-color: #2f3336;
+  color: #71767b;
+}

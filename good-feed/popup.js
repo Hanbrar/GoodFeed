@@ -22,6 +22,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       // If the feed is currently active, broadcast the change immediately
       const { intent: cur, active: cur_active } = await getStorage(['intent', 'active']);
       if (cur_active && cur) {
+        chrome.runtime.sendMessage({
+          action: 'prefetchTweets',
+          query: cur,
+          mode: newMode,
+        }).catch(() => {});
         broadcastToXTabs({ action: 'updateIntent', intent: cur, active: true, mode: newMode });
       }
     });
@@ -34,8 +39,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const currentMode = getSelectedMode();
 
-    // Save to storage first, then broadcast — injection happens in the background.
+    // Save to storage first, start the background fetch, then broadcast.
     await chrome.storage.local.set({ intent: newIntent, active: true, mode: currentMode });
+    chrome.runtime.sendMessage({
+      action: 'prefetchTweets',
+      query: newIntent,
+      mode: currentMode,
+    }).catch(() => {});
     broadcastToXTabs({ action: 'updateIntent', intent: newIntent, active: true, mode: currentMode });
 
     // Close the popup immediately so the user sees their feed update.
@@ -53,6 +63,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     const next = !cur;
     await chrome.storage.local.set({ active: next });
     renderStatus(next, cur_intent || null);
+    if (next && cur_intent) {
+      chrome.runtime.sendMessage({
+        action: 'prefetchTweets',
+        query: cur_intent,
+        mode: cur_mode || 'recent',
+      }).catch(() => {});
+    }
     broadcastToXTabs({
       action: 'updateIntent',
       intent: cur_intent,

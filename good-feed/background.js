@@ -1,290 +1,533 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// GoodFeed — Background Service Worker (Manifest V3)
-// ─────────────────────────────────────────────────────────────────────────────
-
 'use strict';
 
-const cache   = new Map(); // `${query}:${mode}` → { tweets, ts }
 const CACHE_TTL = 5 * 60 * 1000;
+const RESULT_TARGET = 15;
+const MIN_PROGRESS_RESULTS = 10;
+const MAX_STREAM_ATTEMPTS = 18;
+const STREAM_DELAY_MS = 850;
+const STORAGE_PREFIX = 'goodFeedCache:';
+
+const memoryCache = new Map();
+const inflightFetches = new Map();
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.action === 'fetchTopTweets' && msg.query) {
-    const mode = msg.mode || 'recent';
-    handleFetch(msg.query, mode)
+  if (!msg?.query) return;
+
+  const mode = msg.mode || 'recent';
+
+  if (msg.action === 'fetchTopTweets') {
+    fetchTopTweets(msg.query, mode)
       .then(sendResponse)
-      .catch(() => sendResponse({ tweets: [] }));
+      .catch((err) => {
+        console.error('[GoodFeed BG]', err);
+        sendResponse({ tweets: [], done: true });
+      });
+    return true;
+  }
+
+  if (msg.action === 'prefetchTweets') {
+    prefetchTweets(msg.query, mode)
+      .then(sendResponse)
+      .catch((err) => {
+        console.error('[GoodFeed BG]', err);
+        sendResponse({ tweets: [], done: false });
+      });
     return true;
   }
 });
 
-async function handleFetch(query, mode) {
-  const key = `${query}:${mode}`;
-  const hit = cache.get(key);
-  if (hit && (Date.now() - hit.ts) < CACHE_TTL) return { tweets: hit.tweets };
+async function fetchTopTweets(query, mode) {
+  const key = getCacheKey(query, mode);
+  const cached = await getCachedEntry(key);
 
-  const tweets = await scrapeSearchResults(query, mode);
-  cache.set(key, { tweets, ts: Date.now() });
-  return { tweets };
+  if (cached && isFresh(cached) && cached.done) {
+    return { tweets: cached.tweets, done: true, cached: true };
+  }
+
+  const tweets = await ensureFetchJob(query, mode);
+  return { tweets, done: true };
 }
 
-async function scrapeSearchResults(query, mode) {
-  const suffix    = mode === 'trending' ? '' : '&f=live';
-  const searchUrl = `https://x.com/search?q=${encodeURIComponent(query)}${suffix}`;
+async function prefetchTweets(query, mode) {
+  const key = getCacheKey(query, mode);
+  const cached = await getCachedEntry(key);
 
-  // Open an off-screen window (state:'normal', positioned way off the right edge).
-  // Unlike active:false tabs, a normal window has a real viewport so X's
-  // IntersectionObserver fires and lazy-loaded images actually receive their src.
-  // focused:false keeps the user's current window in front.
-  let winId = null;
-  let tabId = null;
+  if (cached && isFresh(cached)) {
+    await broadcastTweets(query, mode, cached.tweets, !!cached.done);
+    if (!cached.done) ensureFetchJob(query, mode);
+    return { tweets: cached.tweets, done: !!cached.done, cached: true };
+  }
+
+  ensureFetchJob(query, mode);
+  return { tweets: [], done: false, started: true };
+}
+
+function ensureFetchJob(query, mode) {
+  const key = getCacheKey(query, mode);
+  if (inflightFetches.has(key)) {
+    return inflightFetches.get(key);
+  }
+
+  const job = streamSearchResults(query, mode)
+    .catch((err) => {
+      console.error('[GoodFeed BG]', err);
+      return [];
+    })
+    .finally(() => {
+      inflightFetches.delete(key);
+    });
+
+  inflightFetches.set(key, job);
+  return job;
+}
+
+async function streamSearchResults(query, mode) {
+  const suffix = mode === 'trending' ? '' : '&f=live';
+  const url = `https://x.com/search?q=${encodeURIComponent(query)}${suffix}`;
+
+  const tab = await chrome.tabs.create({ url, active: false });
+  const collected = new Map();
+  let bestTweets = [];
+  let lastSignature = '';
+  let stableRounds = 0;
 
   try {
-    const win = await chrome.windows.create({
-      url:     searchUrl,
-      state:   'normal',
-      focused: false,
-      left:    99999,   // far off-screen — invisible to user
-      top:     0,
-      width:   1280,
-      height:  900,
-    });
-    winId = win.id;
-    tabId = win.tabs[0].id;
+    await waitForTabComplete(tab.id);
+    await sleep(1800);
 
-    await waitForTabComplete(tabId);
-    await sleep(3500); // React hydration + image network requests
+    for (let attempt = 0; attempt < MAX_STREAM_ATTEMPTS; attempt++) {
+      await nudgeSearchTimeline(tab.id, attempt);
+      await sleep(attempt === 0 ? 500 : STREAM_DELAY_MS);
 
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func:   extractTweets,
-      args:   [mode],
-    });
+      const snapshot = await snapshotTweets(tab.id, mode);
+      mergeSnapshot(collected, snapshot.tweets || []);
 
-    return Array.isArray(result) ? result : [];
-  } catch (err) {
-    console.error('[GoodFeed BG]', err);
-    return [];
+      const nextTweets = materializeTweets(collected, mode).slice(0, RESULT_TARGET);
+      const nextSignature = getTweetsSignature(nextTweets);
+
+      if (nextTweets.length && nextSignature !== lastSignature) {
+        bestTweets = nextTweets;
+        lastSignature = nextSignature;
+        stableRounds = 0;
+        await cacheAndBroadcast(query, mode, bestTweets, false);
+      } else {
+        stableRounds += 1;
+      }
+
+      const enoughTweets = nextTweets.length >= RESULT_TARGET;
+      const enoughProgress = nextTweets.length >= MIN_PROGRESS_RESULTS;
+      const enoughArticles = (snapshot.articleCount || 0) >= RESULT_TARGET;
+      if (
+        enoughTweets ||
+        (enoughArticles && enoughProgress && stableRounds >= 1) ||
+        (attempt >= 6 && enoughProgress && stableRounds >= 2)
+      ) {
+        break;
+      }
+    }
   } finally {
-    if (winId !== null) chrome.windows.remove(winId).catch(() => {});
+    chrome.tabs.remove(tab.id).catch(() => {});
   }
+
+  await cacheAndBroadcast(query, mode, bestTweets, true);
+  return bestTweets;
+}
+
+function mergeSnapshot(collected, tweets) {
+  for (const tweet of tweets) {
+    if (!tweet?.tweetId) continue;
+
+    const existing = collected.get(tweet.tweetId);
+    if (!existing) {
+      collected.set(tweet.tweetId, {
+        ...tweet,
+        firstSeenOrder: collected.size,
+      });
+      continue;
+    }
+
+    collected.set(tweet.tweetId, {
+      ...existing,
+      ...tweet,
+      firstSeenOrder: existing.firstSeenOrder,
+    });
+  }
+}
+
+function materializeTweets(collected, mode) {
+  const tweets = Array.from(collected.values());
+  if (mode === 'trending') {
+    tweets.sort((a, b) => {
+      if ((b.score || 0) !== (a.score || 0)) return (b.score || 0) - (a.score || 0);
+      return (a.firstSeenOrder || 0) - (b.firstSeenOrder || 0);
+    });
+  } else {
+    tweets.sort((a, b) => (a.firstSeenOrder || 0) - (b.firstSeenOrder || 0));
+  }
+
+  return tweets.map((tweet) => ({
+    html: tweet.html,
+    tweetUrl: tweet.tweetUrl,
+    tweetId: tweet.tweetId,
+    username: tweet.username,
+    timestamp: tweet.timestamp,
+    likeNum: tweet.likeNum,
+    repostNum: tweet.repostNum,
+    score: tweet.score || 0,
+  }));
+}
+
+async function snapshotTweets(tabId, mode) {
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: extractTweetsSnapshot,
+    args: [mode, RESULT_TARGET],
+  });
+
+  if (!result || typeof result !== 'object') {
+    return { tweets: [], articleCount: 0 };
+  }
+
+  return {
+    tweets: Array.isArray(result.tweets) ? result.tweets : [],
+    articleCount: Number(result.articleCount) || 0,
+  };
+}
+
+async function nudgeSearchTimeline(tabId, attempt) {
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: scrollSearchTimeline,
+    args: [attempt],
+  });
+}
+
+async function cacheAndBroadcast(query, mode, tweets, done) {
+  const key = getCacheKey(query, mode);
+  const entry = { tweets, ts: Date.now(), done };
+  memoryCache.set(key, entry);
+  await setStorage({ [key]: entry });
+  await broadcastTweets(query, mode, tweets, done);
+}
+
+async function broadcastTweets(query, mode, tweets, done) {
+  const tabs = await chrome.tabs.query({
+    url: ['https://x.com/*', 'https://twitter.com/*'],
+  });
+
+  await Promise.all(tabs.map((tab) =>
+    chrome.tabs.sendMessage(tab.id, {
+      action: 'streamTweets',
+      query,
+      mode,
+      tweets,
+      done,
+    }).catch(() => {})
+  ));
+}
+
+async function getCachedEntry(key) {
+  const hit = memoryCache.get(key);
+  if (hit) return hit;
+
+  const stored = await getStorage(key);
+  const entry = stored[key];
+  if (entry) memoryCache.set(key, entry);
+  return entry || null;
+}
+
+function isFresh(entry) {
+  return !!entry && (Date.now() - entry.ts) < CACHE_TTL;
+}
+
+function getCacheKey(query, mode) {
+  return `${STORAGE_PREFIX}${mode}:${encodeURIComponent((query || '').trim().toLowerCase())}`;
+}
+
+function getTweetsSignature(tweets) {
+  return tweets.map((tweet) => `${tweet.tweetId}:${tweet.timestamp || ''}`).join('|');
 }
 
 function waitForTabComplete(tabId) {
   return new Promise((resolve, reject) => {
     chrome.tabs.get(tabId, (tab) => {
-      if (chrome.runtime.lastError) { reject(chrome.runtime.lastError); return; }
-      if (tab.status === 'complete') { resolve(); return; }
-      const fn = (id, info) => {
-        if (id !== tabId || info.status !== 'complete') return;
-        chrome.tabs.onUpdated.removeListener(fn);
+      if (chrome.runtime.lastError) {
+        reject(chrome.runtime.lastError);
+        return;
+      }
+
+      if (tab.status === 'complete') {
+        resolve();
+        return;
+      }
+
+      const listener = (updatedTabId, info) => {
+        if (updatedTabId !== tabId || info.status !== 'complete') return;
+        chrome.tabs.onUpdated.removeListener(listener);
         resolve();
       };
-      chrome.tabs.onUpdated.addListener(fn);
-      setTimeout(() => { chrome.tabs.onUpdated.removeListener(fn); resolve(); }, 15000);
+
+      chrome.tabs.onUpdated.addListener(listener);
+      setTimeout(() => {
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }, 15000);
     });
   });
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function getStorage(keys) {
+  return new Promise((resolve) => chrome.storage.local.get(keys, resolve));
+}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// extractTweets — runs serialised inside the search tab. Must be self-contained.
-//
-// Strategy (PageRank-for-X):
-//   1. Poll until ≥3 real tweet articles are in the DOM.
-//   2. Collect up to 15 candidates with engagement metrics.
-//   3. Score each tweet: likes + (reposts × 2.5) — reposts are a stronger
-//      quality signal than likes (analogous to citation weight in PageRank).
-//   4. For Trending mode: sort by score descending.
-//   5. For Recent mode: stable order (X's own live chronological ranking).
-//   6. Capture the tweet's full outerHTML so the receiving tab can clone the
-//      real X DOM node — no fake CSS cards, pixel-perfect native appearance.
-// ─────────────────────────────────────────────────────────────────────────────
-function extractTweets(mode) {
-  // ── inline helpers (no closure from outer scope) ───────────────────────────
+function setStorage(items) {
+  return new Promise((resolve) => chrome.storage.local.set(items, resolve));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function scrollSearchTimeline(attempt) {
+  const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+  const targetIndex = Math.min(articles.length - 1, Math.max(0, attempt * 2 + 2));
+  const target = articles[targetIndex];
+
+  if (target) {
+    target.scrollIntoView({ block: 'center' });
+  } else {
+    window.scrollTo(0, document.documentElement.scrollHeight);
+  }
+
+  window.scrollBy(0, Math.max(window.innerHeight, 900));
+}
+
+function extractTweetsSnapshot(mode, maxResults) {
+  const MAX_CANDIDATES = Math.max(maxResults * 2, 30);
+
   function parseCount(str) {
     if (!str) return 0;
-    const s = str.toString().replace(/,/g, '').trim().toUpperCase();
-    const m = s.match(/^([\d.]+)([KMB]?)$/);
-    if (!m) return parseInt(s, 10) || 0;
-    let n = parseFloat(m[1]);
-    if (m[2] === 'K') n *= 1e3;
-    if (m[2] === 'M') n *= 1e6;
-    if (m[2] === 'B') n *= 1e9;
-    return Math.round(n);
+    const normalized = str.toString().replace(/,/g, '').trim().toUpperCase();
+    const match = normalized.match(/^([\d.]+)([KMB]?)$/);
+    if (!match) return parseInt(normalized, 10) || 0;
+
+    let value = parseFloat(match[1]);
+    if (match[2] === 'K') value *= 1e3;
+    if (match[2] === 'M') value *= 1e6;
+    if (match[2] === 'B') value *= 1e9;
+    return Math.round(value);
   }
 
   function getEngagement(article) {
-    // Primary: role="group" aria-label contains all counts in plain text
-    // e.g. "23 replies, 14 reposts, 182 Likes, 14 bookmarks, 891 views"
     const group = article.querySelector('[role="group"]');
     const label = group?.getAttribute('aria-label') || '';
-    let likeNum = 0, repostNum = 0;
+    let likeNum = 0;
+    let repostNum = 0;
 
     if (label) {
-      const lm = label.match(/([\d,]+)\s+Like/i);
-      const rm = label.match(/([\d,]+)\s+(?:repost|Retweet)/i);
-      if (lm) likeNum   = parseCount(lm[1]);
-      if (rm) repostNum = parseCount(rm[1]);
+      const likeMatch = label.match(/([\d,.KMB]+)\s+Like/i);
+      const repostMatch = label.match(/([\d,.KMB]+)\s+(?:repost|Retweet)/i);
+      if (likeMatch) likeNum = parseCount(likeMatch[1]);
+      if (repostMatch) repostNum = parseCount(repostMatch[1]);
     } else {
-      // Fallback: scrape count spans from action buttons
-      const tryBtn = (tid) => {
-        const btn = article.querySelector(`[data-testid="${tid}"]`);
-        if (!btn) return 0;
-        for (const sp of btn.querySelectorAll('span')) {
-          const t = sp.textContent.trim();
-          if (t && /^\d[\d,KMB.]*$/i.test(t)) return parseCount(t);
-        }
-        return 0;
-      };
-      likeNum   = tryBtn('like');
-      repostNum = tryBtn('retweet');
+      likeNum = readCountButton(article, 'like');
+      repostNum = readCountButton(article, 'retweet');
     }
 
     return { likeNum, repostNum };
   }
 
-  // ── polling loop ───────────────────────────────────────────────────────────
-  return new Promise((resolve) => {
-    const MAX_CANDIDATES = 20;
-    const MAX_RESULTS    = 10;
-    const MIN_TWEETS     = 8;   // wait for at least 8 before resolving
-    const MAX_ATTEMPTS   = 30;  // up to 30 × 600 ms = 18 s
-    const POLL_MS        = 600;
-    let attempts = 0;
+  function readCountButton(article, testId) {
+    const button = article.querySelector(`[data-testid="${testId}"]`);
+    if (!button) return 0;
 
-    // Resolve every lazy <img> to its real CDN URL using three strategies:
-    //  1. img.currentSrc — the URL the browser resolved from srcset/src
-    //  2. React internal props (__reactProps$…) — the actual prop value
-    //  3. srcset attribute — first non-placeholder candidate
-    // Without this, images captured from an inactive tab have empty/data: src.
-    function forceLoadImages(articles) {
-      articles.forEach(article => {
-        article.querySelectorAll('img').forEach(img => {
-          img.loading  = 'eager';
-          img.decoding = 'async';
-
-          const curSrc = (img.currentSrc || '').trim();
-          const attrSrc = (img.getAttribute('src') || '').trim();
-          const needsReal = !attrSrc || attrSrc.startsWith('data:');
-
-          if (!needsReal) return; // src already set to a real URL
-
-          // Strategy 1: currentSrc (browser-resolved, even before load)
-          if (curSrc && !curSrc.startsWith('data:')) {
-            img.setAttribute('src', curSrc);
-            return;
-          }
-
-          // Strategy 2: React internal props store the original prop value
-          const reactKey = Object.keys(img).find(k =>
-            k.startsWith('__reactProps') || k.startsWith('__reactFiber')
-          );
-          if (reactKey) {
-            const props = img[reactKey];
-            const rSrc  = props?.src || props?.memoizedProps?.src || '';
-            if (rSrc && !rSrc.startsWith('data:')) {
-              img.setAttribute('src', rSrc);
-              return;
-            }
-          }
-
-          // Strategy 3: srcset attribute (X provides this for all media imgs)
-          const srcset = img.getAttribute('srcset') || '';
-          if (srcset) {
-            const url = srcset.split(',')
-              .map(s => s.trim().split(/\s+/)[0])
-              .find(u => u && !u.startsWith('data:'));
-            if (url) img.setAttribute('src', url);
-          }
-        });
-      });
-      // Final scroll to flush any remaining IntersectionObservers
-      window.scrollTo(0, document.documentElement.scrollHeight);
+    for (const span of button.querySelectorAll('span')) {
+      const text = (span.textContent || '').trim();
+      if (text && /^\d[\d,.KMB]*$/i.test(text)) {
+        return parseCount(text);
+      }
     }
 
-    const poll = async () => {
-      const articles = document.querySelectorAll('article[data-testid="tweet"]');
+    return 0;
+  }
 
-      if (articles.length >= MIN_TWEETS || attempts >= MAX_ATTEMPTS) {
+  function isRealUrl(url) {
+    return typeof url === 'string' && /^https?:\/\//i.test(url) && !url.startsWith('blob:') && !url.startsWith('data:');
+  }
 
-        // ── Force images to load BEFORE capturing outerHTML ──────────────
-        forceLoadImages(articles);
-        // Give the browser time to kick off the image network requests and
-        // update the src attributes in the DOM
-        await new Promise(r => setTimeout(r, 1200));
-        window.scrollTo(0, 0);
-        await new Promise(r => setTimeout(r, 300));
+  function firstRealUrl(values) {
+    for (const value of values) {
+      if (isRealUrl(value)) return value;
+    }
+    return '';
+  }
 
-        const candidates = [];
+  function extractUrlFromSrcset(srcset) {
+    if (!srcset) return '';
+    return firstRealUrl(
+      srcset
+        .split(',')
+        .map((part) => part.trim().split(/\s+/)[0])
+    );
+  }
 
-        articles.forEach((article, idx) => {
-          if (idx >= MAX_CANDIDATES) return;
-          try {
-            // ── tweet URL ───────────────────────────────────────────────────
-            const statusLink = article.querySelector('a[href*="/status/"]');
-            const tweetUrl   = statusLink?.href;
-            if (!tweetUrl) return;
+  function getReactMediaUrl(node, matcher) {
+    const reactKey = Object.keys(node).find((key) =>
+      key.startsWith('__reactProps') || key.startsWith('__reactFiber')
+    );
+    if (!reactKey) return '';
 
-            const urlMatch = tweetUrl.match(
-              /(?:x\.com|twitter\.com)\/([A-Za-z0-9_]+)\/status\/(\d+)/
-            );
-            if (!urlMatch) return;
+    const visited = new Set();
+    const queue = [node[reactKey]];
+    while (queue.length) {
+      const value = queue.shift();
+      if (!value || typeof value !== 'object' || visited.has(value)) continue;
+      visited.add(value);
 
-            // ── require either text or media (skip bare RT wrappers) ────────
-            const textEl  = article.querySelector('[data-testid="tweetText"]');
-            const text    = textEl ? (textEl.innerText || textEl.textContent || '').trim() : '';
-            const hasMedia = !!article.querySelector(
-              '[data-testid="tweetPhoto"], [data-testid="videoComponent"], [data-testid="card.wrapper"]'
-            );
-            if (!text && !hasMedia) return;
-
-            // ── engagement ──────────────────────────────────────────────────
-            const { likeNum, repostNum } = getEngagement(article);
-
-            // ── timestamp ───────────────────────────────────────────────────
-            const timeEl    = article.querySelector('time');
-            const timestamp = timeEl?.getAttribute('datetime') || '';
-
-            // ── PageRank-style score ────────────────────────────────────────
-            const score = likeNum + repostNum * 2.5;
-
-            candidates.push({
-              article,
-              tweetUrl:  tweetUrl,
-              tweetId:   urlMatch[2],
-              username:  urlMatch[1],
-              timestamp,
-              likeNum,
-              repostNum,
-              score,
-            });
-          } catch (_) { /* skip malformed */ }
-        });
-
-        // Sort for Trending (leave stable for Recent)
-        if (mode === 'trending') {
-          candidates.sort((a, b) => b.score - a.score);
+      for (const child of Object.values(value)) {
+        if (typeof child === 'string' && matcher(child)) {
+          return child;
         }
-
-        // Capture outerHTML AFTER image forcing so src attributes are set
-        const results = candidates.slice(0, MAX_RESULTS).map(c => ({
-          html:      c.article.outerHTML,
-          tweetUrl:  c.tweetUrl,
-          tweetId:   c.tweetId,
-          username:  c.username,
-          timestamp: c.timestamp,
-          likeNum:   c.likeNum,
-          repostNum: c.repostNum,
-        }));
-
-        resolve(results);
-      } else {
-        attempts++;
-        setTimeout(poll, POLL_MS);
+        if (child && typeof child === 'object') {
+          queue.push(child);
+        }
       }
-    };
+    }
 
-    setTimeout(poll, 1000); // initial React hydration pause
+    return '';
+  }
+
+  function findDataUrl(node, matcher) {
+    for (const attr of Array.from(node.attributes || [])) {
+      if (matcher(attr.value)) return attr.value;
+    }
+    return '';
+  }
+
+  function repairImage(img) {
+    const nextSrc = firstRealUrl([
+      img.getAttribute('src'),
+      img.currentSrc,
+      extractUrlFromSrcset(img.getAttribute('srcset') || ''),
+      findDataUrl(img, isRealUrl),
+      getReactMediaUrl(img, isRealUrl),
+    ]);
+
+    if (nextSrc) {
+      img.setAttribute('src', nextSrc);
+      img.src = nextSrc;
+    }
+
+    const nextSrcset = img.getAttribute('srcset') || '';
+    if (nextSrcset) img.setAttribute('srcset', nextSrcset);
+    img.loading = 'eager';
+    img.decoding = 'async';
+  }
+
+  function repairVideo(video) {
+    const posterMatcher = (value) => isRealUrl(value) && /twimg\.com/i.test(value);
+    const sourceMatcher = (value) => isRealUrl(value) && /(twimg\.com|video\.twimg\.com)/i.test(value);
+
+    const poster = firstRealUrl([
+      video.getAttribute('poster'),
+      video.poster,
+      findDataUrl(video, posterMatcher),
+      getReactMediaUrl(video, posterMatcher),
+    ]);
+
+    if (poster) {
+      video.setAttribute('poster', poster);
+      video.poster = poster;
+    }
+
+    const videoSrc = firstRealUrl([
+      video.getAttribute('src'),
+      video.currentSrc,
+      findDataUrl(video, sourceMatcher),
+      getReactMediaUrl(video, sourceMatcher),
+    ]);
+
+    if (videoSrc) {
+      video.setAttribute('src', videoSrc);
+    }
+
+    video.preload = 'metadata';
+    video.setAttribute('playsinline', '');
+
+    for (const source of video.querySelectorAll('source')) {
+      const sourceUrl = firstRealUrl([
+        source.getAttribute('src'),
+        findDataUrl(source, sourceMatcher),
+        getReactMediaUrl(source, sourceMatcher),
+        videoSrc,
+      ]);
+      if (sourceUrl) source.setAttribute('src', sourceUrl);
+    }
+  }
+
+  function normalizeMedia(article) {
+    article.querySelectorAll('img').forEach(repairImage);
+    article.querySelectorAll('video').forEach(repairVideo);
+  }
+
+  const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+  const candidates = [];
+  const seenTweetIds = new Set();
+
+  articles.forEach((article, index) => {
+    if (index >= MAX_CANDIDATES) return;
+
+    try {
+      const statusLink = article.querySelector('a[href*="/status/"]');
+      const tweetUrl = statusLink?.href;
+      if (!tweetUrl) return;
+
+      const urlMatch = tweetUrl.match(/(?:x\.com|twitter\.com)\/([A-Za-z0-9_]+)\/status\/(\d+)/);
+      if (!urlMatch) return;
+
+      const tweetId = urlMatch[2];
+      if (seenTweetIds.has(tweetId)) return;
+      seenTweetIds.add(tweetId);
+
+      const textEl = article.querySelector('[data-testid="tweetText"]');
+      const text = textEl ? (textEl.innerText || textEl.textContent || '').trim() : '';
+      const hasMedia = !!article.querySelector(
+        '[data-testid="tweetPhoto"], [data-testid="videoComponent"], [data-testid="card.wrapper"], video, img'
+      );
+      if (!text && !hasMedia) return;
+
+      normalizeMedia(article);
+
+      const { likeNum, repostNum } = getEngagement(article);
+      const timeEl = article.querySelector('time');
+      const timestamp = timeEl?.getAttribute('datetime') || '';
+      const score = likeNum + repostNum * 2.5;
+
+      candidates.push({
+        html: article.outerHTML,
+        tweetUrl,
+        tweetId,
+        username: urlMatch[1],
+        timestamp,
+        likeNum,
+        repostNum,
+        score,
+        domIndex: index,
+      });
+    } catch (_) {
+      // Ignore malformed tweets in the search feed.
+    }
   });
+
+  if (mode === 'trending') {
+    candidates.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return a.domIndex - b.domIndex;
+    });
+  }
+
+  return {
+    articleCount: articles.length,
+    tweets: candidates.slice(0, maxResults),
+  };
 }

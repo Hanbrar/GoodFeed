@@ -150,11 +150,14 @@
     wrapper.className = 'goodfeed-wrapper';
 
     let injected = 0;
-    for (const tweet of tweets.slice(0, 5)) {
+    for (const tweet of tweets.slice(0, 10)) {
       if (!tweet.html) continue;
 
       const node = cloneFromHtml(tweet.html);
       if (!node) continue;
+
+      // Ensure images that were lazy in the search tab load eagerly here
+      fixClonedImages(node);
 
       // The parsed node could be an <article> or a <div> wrapping an <article>
       const article = node.matches('article') ? node : node.querySelector('article');
@@ -183,6 +186,27 @@
     if (!el) return null;
     // importNode(node, deep=true) adopts the element into the current document.
     return document.importNode(el, true);
+  }
+
+  // Ensure images inside a cloned tweet actually load.
+  // The search tab is inactive so X's IntersectionObserver never fires — images
+  // may still have empty or data-URI src when we capture outerHTML. We fix them
+  // here in the visible For You tab where loading will succeed immediately.
+  function fixClonedImages(node) {
+    node.querySelectorAll('img').forEach(img => {
+      img.loading  = 'eager';
+      img.decoding = 'async';
+      const src = img.getAttribute('src') || '';
+      if (!src || src.startsWith('data:')) {
+        // X always supplies srcset for media — pick the first real URL
+        const srcset = img.getAttribute('srcset') || '';
+        if (srcset) {
+          const url = srcset.split(',').map(s => s.trim().split(/\s+/)[0])
+            .find(u => u && !u.startsWith('data:'));
+          if (url) img.src = url;
+        }
+      }
+    });
   }
 
   // X's React onClick handlers don't survive cloning.

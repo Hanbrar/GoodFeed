@@ -35,7 +35,7 @@ async function scrapeSearchResults(query, mode) {
   const tab = await chrome.tabs.create({ url, active: false });
   try {
     await waitForTabComplete(tab.id);
-    await sleep(1800); // React hydration buffer
+    await sleep(2500); // React hydration + lazy-image settle buffer
 
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
@@ -129,17 +129,51 @@ function extractTweets(mode) {
 
   // ── polling loop ───────────────────────────────────────────────────────────
   return new Promise((resolve) => {
-    const MAX_CANDIDATES = 15;
-    const MAX_RESULTS    = 8;
+    const MAX_CANDIDATES = 20;
+    const MAX_RESULTS    = 10;
     const MIN_TWEETS     = 3;
     const MAX_ATTEMPTS   = 20;
     const POLL_MS        = 600;
     let attempts = 0;
 
-    const poll = () => {
+    // Force any lazy-loaded image in an article to reveal its real src.
+    // X uses IntersectionObserver for lazy loading which never fires in an
+    // inactive tab. We override by: (1) setting loading="eager", (2) promoting
+    // srcset candidates to src, (3) scrolling to flush the IO queue.
+    function forceLoadImages(articles) {
+      articles.forEach(article => {
+        article.querySelectorAll('img').forEach(img => {
+          img.loading  = 'eager';
+          img.decoding = 'async';
+          const src = img.getAttribute('src') || '';
+          if (!src || src.startsWith('data:')) {
+            // Pull best URL from srcset (X always provides srcset for media)
+            const srcset = img.getAttribute('srcset') || '';
+            if (srcset) {
+              const url = srcset.split(',').map(s => s.trim().split(/\s+/)[0])
+                .find(u => u && !u.startsWith('data:'));
+              if (url) img.src = url;
+            }
+          }
+        });
+      });
+      // Scroll to bottom → top to trigger any remaining IntersectionObservers
+      window.scrollTo(0, document.documentElement.scrollHeight);
+    }
+
+    const poll = async () => {
       const articles = document.querySelectorAll('article[data-testid="tweet"]');
 
       if (articles.length >= MIN_TWEETS || attempts >= MAX_ATTEMPTS) {
+
+        // ── Force images to load BEFORE capturing outerHTML ──────────────
+        forceLoadImages(articles);
+        // Give the browser time to kick off the image network requests and
+        // update the src attributes in the DOM
+        await new Promise(r => setTimeout(r, 1200));
+        window.scrollTo(0, 0);
+        await new Promise(r => setTimeout(r, 300));
+
         const candidates = [];
 
         articles.forEach((article, idx) => {
@@ -155,24 +189,27 @@ function extractTweets(mode) {
             );
             if (!urlMatch) return;
 
-            // ── tweet text must exist (skip media-only / RT-only articles) ─
-            const textEl = article.querySelector('[data-testid="tweetText"]');
-            const text   = textEl ? (textEl.innerText || textEl.textContent || '').trim() : '';
-            if (!text) return;
+            // ── require either text or media (skip bare RT wrappers) ────────
+            const textEl  = article.querySelector('[data-testid="tweetText"]');
+            const text    = textEl ? (textEl.innerText || textEl.textContent || '').trim() : '';
+            const hasMedia = !!article.querySelector(
+              '[data-testid="tweetPhoto"], [data-testid="videoComponent"], [data-testid="card.wrapper"]'
+            );
+            if (!text && !hasMedia) return;
 
             // ── engagement ──────────────────────────────────────────────────
             const { likeNum, repostNum } = getEngagement(article);
 
             // ── timestamp ───────────────────────────────────────────────────
-            const timeEl   = article.querySelector('time');
+            const timeEl    = article.querySelector('time');
             const timestamp = timeEl?.getAttribute('datetime') || '';
 
-            // ── PageRank-style score: reposts weighted 2.5× over likes ─────
+            // ── PageRank-style score ────────────────────────────────────────
             const score = likeNum + repostNum * 2.5;
 
             candidates.push({
-              article,   // live DOM reference — used for outerHTML capture
-              tweetUrl:  urlMatch[0].startsWith('http') ? tweetUrl : `https://${urlMatch[0]}`,
+              article,
+              tweetUrl:  tweetUrl,
               tweetId:   urlMatch[2],
               username:  urlMatch[1],
               timestamp,
@@ -188,15 +225,15 @@ function extractTweets(mode) {
           candidates.sort((a, b) => b.score - a.score);
         }
 
-        // Capture outerHTML now (after sort) so we send the best ones first
+        // Capture outerHTML AFTER image forcing so src attributes are set
         const results = candidates.slice(0, MAX_RESULTS).map(c => ({
-          html:       c.article.outerHTML,
-          tweetUrl:   c.tweetUrl,
-          tweetId:    c.tweetId,
-          username:   c.username,
-          timestamp:  c.timestamp,
-          likeNum:    c.likeNum,
-          repostNum:  c.repostNum,
+          html:      c.article.outerHTML,
+          tweetUrl:  c.tweetUrl,
+          tweetId:   c.tweetId,
+          username:  c.username,
+          timestamp: c.timestamp,
+          likeNum:   c.likeNum,
+          repostNum: c.repostNum,
         }));
 
         resolve(results);

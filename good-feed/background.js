@@ -28,17 +28,34 @@ async function handleFetch(query, mode) {
 }
 
 async function scrapeSearchResults(query, mode) {
-  // Recent → &f=live (chronological). Trending → default Top search (X's own ranking).
-  const suffix = mode === 'trending' ? '' : '&f=live';
-  const url    = `https://x.com/search?q=${encodeURIComponent(query)}${suffix}`;
+  const suffix    = mode === 'trending' ? '' : '&f=live';
+  const searchUrl = `https://x.com/search?q=${encodeURIComponent(query)}${suffix}`;
 
-  const tab = await chrome.tabs.create({ url, active: false });
+  // Open an off-screen window (state:'normal', positioned way off the right edge).
+  // Unlike active:false tabs, a normal window has a real viewport so X's
+  // IntersectionObserver fires and lazy-loaded images actually receive their src.
+  // focused:false keeps the user's current window in front.
+  let winId = null;
+  let tabId = null;
+
   try {
-    await waitForTabComplete(tab.id);
-    await sleep(2500); // React hydration + lazy-image settle buffer
+    const win = await chrome.windows.create({
+      url:     searchUrl,
+      state:   'normal',
+      focused: false,
+      left:    99999,   // far off-screen — invisible to user
+      top:     0,
+      width:   1280,
+      height:  900,
+    });
+    winId = win.id;
+    tabId = win.tabs[0].id;
+
+    await waitForTabComplete(tabId);
+    await sleep(3500); // React hydration + image network requests
 
     const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId },
       func:   extractTweets,
       args:   [mode],
     });
@@ -48,7 +65,7 @@ async function scrapeSearchResults(query, mode) {
     console.error('[GoodFeed BG]', err);
     return [];
   } finally {
-    chrome.tabs.remove(tab.id).catch(() => {});
+    if (winId !== null) chrome.windows.remove(winId).catch(() => {});
   }
 }
 
@@ -131,33 +148,58 @@ function extractTweets(mode) {
   return new Promise((resolve) => {
     const MAX_CANDIDATES = 20;
     const MAX_RESULTS    = 10;
-    const MIN_TWEETS     = 3;
-    const MAX_ATTEMPTS   = 20;
+    const MIN_TWEETS     = 8;   // wait for at least 8 before resolving
+    const MAX_ATTEMPTS   = 30;  // up to 30 × 600 ms = 18 s
     const POLL_MS        = 600;
     let attempts = 0;
 
-    // Force any lazy-loaded image in an article to reveal its real src.
-    // X uses IntersectionObserver for lazy loading which never fires in an
-    // inactive tab. We override by: (1) setting loading="eager", (2) promoting
-    // srcset candidates to src, (3) scrolling to flush the IO queue.
+    // Resolve every lazy <img> to its real CDN URL using three strategies:
+    //  1. img.currentSrc — the URL the browser resolved from srcset/src
+    //  2. React internal props (__reactProps$…) — the actual prop value
+    //  3. srcset attribute — first non-placeholder candidate
+    // Without this, images captured from an inactive tab have empty/data: src.
     function forceLoadImages(articles) {
       articles.forEach(article => {
         article.querySelectorAll('img').forEach(img => {
           img.loading  = 'eager';
           img.decoding = 'async';
-          const src = img.getAttribute('src') || '';
-          if (!src || src.startsWith('data:')) {
-            // Pull best URL from srcset (X always provides srcset for media)
-            const srcset = img.getAttribute('srcset') || '';
-            if (srcset) {
-              const url = srcset.split(',').map(s => s.trim().split(/\s+/)[0])
-                .find(u => u && !u.startsWith('data:'));
-              if (url) img.src = url;
+
+          const curSrc = (img.currentSrc || '').trim();
+          const attrSrc = (img.getAttribute('src') || '').trim();
+          const needsReal = !attrSrc || attrSrc.startsWith('data:');
+
+          if (!needsReal) return; // src already set to a real URL
+
+          // Strategy 1: currentSrc (browser-resolved, even before load)
+          if (curSrc && !curSrc.startsWith('data:')) {
+            img.setAttribute('src', curSrc);
+            return;
+          }
+
+          // Strategy 2: React internal props store the original prop value
+          const reactKey = Object.keys(img).find(k =>
+            k.startsWith('__reactProps') || k.startsWith('__reactFiber')
+          );
+          if (reactKey) {
+            const props = img[reactKey];
+            const rSrc  = props?.src || props?.memoizedProps?.src || '';
+            if (rSrc && !rSrc.startsWith('data:')) {
+              img.setAttribute('src', rSrc);
+              return;
             }
+          }
+
+          // Strategy 3: srcset attribute (X provides this for all media imgs)
+          const srcset = img.getAttribute('srcset') || '';
+          if (srcset) {
+            const url = srcset.split(',')
+              .map(s => s.trim().split(/\s+/)[0])
+              .find(u => u && !u.startsWith('data:'));
+            if (url) img.setAttribute('src', url);
           }
         });
       });
-      // Scroll to bottom → top to trigger any remaining IntersectionObservers
+      // Final scroll to flush any remaining IntersectionObservers
       window.scrollTo(0, document.documentElement.scrollHeight);
     }
 

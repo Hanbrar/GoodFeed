@@ -3,7 +3,7 @@
   "name": "Good Feed",
   "version": "0.1.0",
   "description": "Customizes your X For You feed around topics you actually care about.",
-  "permissions": ["storage", "activeTab", "scripting", "tabs"],
+  "permissions": ["storage", "activeTab", "scripting", "tabs", "windows"],
   "host_permissions": ["https://x.com/*", "https://twitter.com/*"],
   "action": {
     "default_popup": "popup.html",

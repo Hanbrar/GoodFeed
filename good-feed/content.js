@@ -188,22 +188,31 @@
     return document.importNode(el, true);
   }
 
-  // Ensure images inside a cloned tweet actually load.
-  // The search tab is inactive so X's IntersectionObserver never fires — images
-  // may still have empty or data-URI src when we capture outerHTML. We fix them
-  // here in the visible For You tab where loading will succeed immediately.
+  // Post-clone image repair: we're now in the visible For You tab so any img
+  // with a valid src will load immediately. Fix ones that still have placeholder
+  // src (data: URI or empty) by pulling the real URL from srcset.
   function fixClonedImages(node) {
     node.querySelectorAll('img').forEach(img => {
       img.loading  = 'eager';
       img.decoding = 'async';
+
       const src = img.getAttribute('src') || '';
-      if (!src || src.startsWith('data:')) {
-        // X always supplies srcset for media — pick the first real URL
-        const srcset = img.getAttribute('srcset') || '';
-        if (srcset) {
-          const url = srcset.split(',').map(s => s.trim().split(/\s+/)[0])
-            .find(u => u && !u.startsWith('data:'));
-          if (url) img.src = url;
+      if (src && !src.startsWith('data:')) return; // already good
+
+      // srcset holds the CDN URL even when src is a placeholder
+      const srcset = img.getAttribute('srcset') || '';
+      if (srcset) {
+        const url = srcset.split(',')
+          .map(s => s.trim().split(/\s+/)[0])
+          .find(u => u && !u.startsWith('data:'));
+        if (url) { img.src = url; return; }
+      }
+
+      // Fallback: any data-* attribute that looks like a real URL
+      for (const attr of img.attributes) {
+        if (attr.name.startsWith('data-') && attr.value.startsWith('https://')) {
+          img.src = attr.value;
+          return;
         }
       }
     });

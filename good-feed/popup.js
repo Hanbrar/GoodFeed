@@ -4,26 +4,42 @@ document.addEventListener('DOMContentLoaded', async () => {
   const toggleBtn   = document.getElementById('toggleBtn');
   const statusDot   = document.getElementById('statusDot');
   const statusText  = document.getElementById('statusText');
+  const modeBtns    = document.querySelectorAll('.mode-btn');
 
   // ── Load persisted state ──────────────────────────────────────────────────
-  const { intent, active } = await getStorage(['intent', 'active']);
+  const { intent, active, mode } = await getStorage(['intent', 'active', 'mode']);
   if (intent) intentInput.value = intent;
+  setActiveMode(mode || 'recent');
   renderStatus(!!active, intent || null);
+
+  // ── Mode toggle ───────────────────────────────────────────────────────────
+  modeBtns.forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const newMode = btn.dataset.mode;
+      setActiveMode(newMode);
+      await chrome.storage.local.set({ mode: newMode });
+
+      // If the feed is currently active, broadcast the change immediately
+      const { intent: cur, active: cur_active } = await getStorage(['intent', 'active']);
+      if (cur_active && cur) {
+        broadcastToXTabs({ action: 'updateIntent', intent: cur, active: true, mode: newMode });
+      }
+    });
+  });
 
   // ── Set My Feed ───────────────────────────────────────────────────────────
   setFeedBtn.addEventListener('click', async () => {
     const newIntent = intentInput.value.trim();
-    if (!newIntent) {
-      intentInput.focus();
-      return;
-    }
+    if (!newIntent) { intentInput.focus(); return; }
+
+    const currentMode = getSelectedMode();
 
     setFeedBtn.disabled = true;
     setFeedBtn.textContent = 'Setting…';
 
-    await chrome.storage.local.set({ intent: newIntent, active: true });
+    await chrome.storage.local.set({ intent: newIntent, active: true, mode: currentMode });
     renderStatus(true, newIntent);
-    broadcastToXTabs({ action: 'updateIntent', intent: newIntent, active: true });
+    broadcastToXTabs({ action: 'updateIntent', intent: newIntent, active: true, mode: currentMode });
 
     setFeedBtn.textContent = 'Feed Set!';
     setTimeout(() => {
@@ -32,23 +48,41 @@ document.addEventListener('DOMContentLoaded', async () => {
     }, 1500);
   });
 
-  // Allow Enter key in the input
-  intentInput.addEventListener('keydown', (e) => {
+  intentInput.addEventListener('keydown', e => {
     if (e.key === 'Enter') setFeedBtn.click();
   });
 
-  // ── Toggle ────────────────────────────────────────────────────────────────
+  // ── On/Off toggle ─────────────────────────────────────────────────────────
   toggleBtn.addEventListener('click', async () => {
-    const { active: cur, intent: cur_intent } = await getStorage(['active', 'intent']);
+    const { active: cur, intent: cur_intent, mode: cur_mode } =
+      await getStorage(['active', 'intent', 'mode']);
     const next = !cur;
     await chrome.storage.local.set({ active: next });
     renderStatus(next, cur_intent || null);
-    broadcastToXTabs({ action: 'updateIntent', intent: cur_intent, active: next });
+    broadcastToXTabs({
+      action: 'updateIntent',
+      intent: cur_intent,
+      active: next,
+      mode: cur_mode || 'recent',
+    });
   });
 
   // ── Helpers ───────────────────────────────────────────────────────────────
   function getStorage(keys) {
     return new Promise(resolve => chrome.storage.local.get(keys, resolve));
+  }
+
+  function setActiveMode(modeValue) {
+    modeBtns.forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.mode === modeValue);
+    });
+  }
+
+  function getSelectedMode() {
+    for (const btn of modeBtns) {
+      if (btn.classList.contains('active')) return btn.dataset.mode;
+    }
+    return 'recent';
   }
 
   function renderStatus(isActive, currentIntent) {
@@ -69,12 +103,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   async function broadcastToXTabs(message) {
     const tabs = await chrome.tabs.query({
-      url: ['https://x.com/*', 'https://twitter.com/*']
+      url: ['https://x.com/*', 'https://twitter.com/*'],
     });
     for (const tab of tabs) {
-      chrome.tabs.sendMessage(tab.id, message).catch(() => {
-        // Tab may not have content script ready yet — safe to ignore
-      });
+      chrome.tabs.sendMessage(tab.id, message).catch(() => {});
     }
   }
 });

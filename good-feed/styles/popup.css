@@ -55,6 +55,41 @@ body {
   line-height: 1.4;
 }
 
+/* ── Mode toggle (Recent / Trending) ── */
+.mode-toggle {
+  display: flex;
+  gap: 3px;
+  background: #161616;
+  border: 1px solid #2f3336;
+  border-radius: 8px;
+  padding: 3px;
+}
+
+.mode-btn {
+  flex: 1;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #71767b;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  letter-spacing: 0.01em;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.mode-btn:hover:not(.active) {
+  background: rgba(255, 255, 255, 0.05);
+  color: #e7e9ea;
+}
+
+.mode-btn.active {
+  background: #1d9bf0;
+  color: #fff;
+}
+
 .intent-input {
   width: 100%;
   padding: 10px 12px;

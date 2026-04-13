@@ -1,34 +1,28 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // GoodFeed — Content Script
 // Injected into every x.com / twitter.com page.
-// Responsibilities:
-//   1. On load (and every SPA navigation) check if we are on the home feed.
-//   2. Request top tweets from background.js for the active intent.
-//   3. Wait for the For You feed to render, then inject tweet cards.
-//   4. Re-inject if X's React re-renders wipe out our cards.
-//   5. Listen for popup messages (intent change / toggle).
 // ─────────────────────────────────────────────────────────────────────────────
 
 (function () {
   'use strict';
 
-  let cachedTweets   = [];   // tweets for the current intent (in-memory cache)
+  let cachedTweets   = [];
   let cachedIntent   = '';
-  let feedObserver   = null; // watches for feed container to appear
-  let removalWatcher = null; // watches for our cards being removed by React
+  let cachedMode     = '';
+  let feedObserver   = null;
+  let removalWatcher = null;
   let isFetching     = false;
 
   // ── Entry point ─────────────────────────────────────────────────────────────
   patchHistoryForSPA();
   window.addEventListener('locationchange', onNavigation);
   window.addEventListener('popstate',       onNavigation);
-
   init();
 
   async function init() {
-    const { intent, active } = await getStorage(['intent', 'active']);
+    const { intent, active, mode } = await getStorage(['intent', 'active', 'mode']);
     if (active && intent && isHomePage()) {
-      await activateFeed(intent);
+      await activateFeed(intent, mode || 'recent');
     }
   }
 
@@ -42,19 +36,19 @@
   }
 
   async function onNavigation() {
-    await sleep(400); // let React finish painting the new route
-    const { intent, active } = await getStorage(['intent', 'active']);
+    await sleep(400);
+    const { intent, active, mode } = await getStorage(['intent', 'active', 'mode']);
     if (active && intent && isHomePage()) {
-      await activateFeed(intent);
+      await activateFeed(intent, mode || 'recent');
     } else {
       cleanup();
     }
   }
 
   // ── Feed activation ─────────────────────────────────────────────────────────
-  async function activateFeed(intent) {
-    // Return immediately from cache if the intent hasn't changed
-    if (cachedTweets.length && cachedIntent === intent) {
+  async function activateFeed(intent, mode) {
+    // Serve from cache if nothing changed
+    if (cachedTweets.length && cachedIntent === intent && cachedMode === mode) {
       waitForFeedAndInject(cachedTweets);
       return;
     }
@@ -65,12 +59,14 @@
     try {
       const response = await chrome.runtime.sendMessage({
         action: 'fetchTopTweets',
-        query: intent
+        query: intent,
+        mode,
       });
 
       if (response?.tweets?.length) {
-        cachedTweets  = response.tweets;
-        cachedIntent  = intent;
+        cachedTweets = response.tweets;
+        cachedIntent = intent;
+        cachedMode   = mode;
         waitForFeedAndInject(response.tweets);
       }
     } catch (err) {
@@ -89,7 +85,6 @@
       return;
     }
 
-    // Feed not in DOM yet — observe until it appears
     if (feedObserver) feedObserver.disconnect();
     feedObserver = new MutationObserver(() => {
       const f = getFeedContainer();
@@ -111,10 +106,8 @@
   }
 
   function injectTweets(container, tweets) {
-    // Remove any previous injection
     document.querySelectorAll('.goodfeed-wrapper').forEach(el => el.remove());
 
-    // Find the first rendered tweet article — if not there yet, retry shortly
     const firstArticle = container.querySelector('article[data-testid="tweet"]');
     if (!firstArticle) {
       setTimeout(() => {
@@ -134,20 +127,17 @@
     const wrapper = document.createElement('div');
     wrapper.className = 'goodfeed-wrapper';
 
-    tweets.slice(0, 5).forEach(tweet => {
-      wrapper.appendChild(buildCard(tweet));
-    });
+    tweets.slice(0, 5).forEach(tweet => wrapper.appendChild(buildCard(tweet)));
 
     parent.insertBefore(wrapper, firstArticle);
   }
 
-  // ── Removal watcher (handles React re-renders) ───────────────────────────────
+  // ── Removal watcher ──────────────────────────────────────────────────────────
   function watchForRemoval(container, tweets) {
     if (removalWatcher) removalWatcher.disconnect();
 
     removalWatcher = new MutationObserver(() => {
       if (!document.querySelector('.goodfeed-wrapper')) {
-        // Cards got wiped — re-inject after a short delay
         setTimeout(() => injectTweets(container, tweets), 600);
       }
     });
@@ -166,7 +156,7 @@
     badge.textContent = '✦ Good Feed';
     card.appendChild(badge);
 
-    // Clickable link wrapper
+    // Link wrapper
     const link = document.createElement('a');
     link.className = 'goodfeed-card-link';
     if (isSafeXUrl(tweet.tweetUrl)) {
@@ -176,33 +166,34 @@
     }
     card.appendChild(link);
 
-    // Inner flex row
+    // Inner row
     const inner = document.createElement('div');
     inner.className = 'goodfeed-card-inner';
     link.appendChild(inner);
 
-    // Avatar
+    // ── Avatar ────────────────────────────────────────────────────────────────
     const avatarCol = document.createElement('div');
     avatarCol.className = 'goodfeed-avatar-col';
+
     if (tweet.avatarUrl && isSafeImgUrl(tweet.avatarUrl)) {
       const img = document.createElement('img');
-      img.className         = 'goodfeed-avatar';
-      img.src               = tweet.avatarUrl;
-      img.alt               = tweet.displayName || tweet.username || '';
-      img.referrerPolicy    = 'no-referrer';
-      img.onerror           = () => { img.replaceWith(avatarPlaceholder(tweet)); };
+      img.className      = 'goodfeed-avatar';
+      img.src            = tweet.avatarUrl;
+      img.alt            = tweet.displayName || tweet.username || '';
+      img.referrerPolicy = 'no-referrer';
+      img.onerror        = () => img.replaceWith(avatarPlaceholder(tweet));
       avatarCol.appendChild(img);
     } else {
       avatarCol.appendChild(avatarPlaceholder(tweet));
     }
     inner.appendChild(avatarCol);
 
-    // Content column
+    // ── Content column ────────────────────────────────────────────────────────
     const contentCol = document.createElement('div');
     contentCol.className = 'goodfeed-content-col';
     inner.appendChild(contentCol);
 
-    // Header row
+    // Header: name · @handle · time
     const header = document.createElement('div');
     header.className = 'goodfeed-tweet-header';
 
@@ -212,10 +203,10 @@
     header.appendChild(nameSpan);
 
     if (tweet.username) {
-      const handleSpan = document.createElement('span');
-      handleSpan.className   = 'goodfeed-username';
-      handleSpan.textContent = `@${tweet.username}`;
-      header.appendChild(handleSpan);
+      const handle = document.createElement('span');
+      handle.className   = 'goodfeed-username';
+      handle.textContent = `@${tweet.username}`;
+      header.appendChild(handle);
     }
 
     if (tweet.timestamp) {
@@ -238,7 +229,41 @@
     textEl.textContent = tweet.text || '';
     contentCol.appendChild(textEl);
 
+    // ── Engagement row (likes + reposts) ──────────────────────────────────────
+    const hasLikes   = tweet.likeNum   > 0;
+    const hasReposts = tweet.repostNum > 0;
+
+    if (hasLikes || hasReposts) {
+      const engRow = document.createElement('div');
+      engRow.className = 'goodfeed-engagement';
+
+      if (hasReposts) {
+        engRow.appendChild(engItem('↺', formatCount(tweet.repostNum), 'goodfeed-eng-repost'));
+      }
+      if (hasLikes) {
+        engRow.appendChild(engItem('♡', formatCount(tweet.likeNum), 'goodfeed-eng-like'));
+      }
+
+      contentCol.appendChild(engRow);
+    }
+
     return card;
+  }
+
+  function engItem(iconChar, countStr, extraClass) {
+    const wrap = document.createElement('span');
+    wrap.className = `goodfeed-eng-item ${extraClass}`;
+
+    const icon = document.createElement('span');
+    icon.className   = 'goodfeed-eng-icon';
+    icon.textContent = iconChar;
+
+    const count = document.createElement('span');
+    count.textContent = countStr;
+
+    wrap.appendChild(icon);
+    wrap.appendChild(count);
+    return wrap;
   }
 
   function avatarPlaceholder(tweet) {
@@ -259,17 +284,19 @@
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.action !== 'updateIntent') return;
 
-    cachedTweets = []; // force re-fetch on intent change
+    // Clear cache so the new intent/mode triggers a fresh fetch
+    cachedTweets = [];
     cachedIntent = '';
+    cachedMode   = '';
 
     if (msg.active && msg.intent && isHomePage()) {
-      activateFeed(msg.intent);
+      activateFeed(msg.intent, msg.mode || 'recent');
     } else {
       cleanup();
     }
   });
 
-  // ── Utility helpers ──────────────────────────────────────────────────────────
+  // ── Utilities ────────────────────────────────────────────────────────────────
   function isHomePage() {
     const p = window.location.pathname;
     return p === '/' || p === '/home';
@@ -295,11 +322,7 @@
     if (!url) return false;
     try {
       const u = new URL(url);
-      return (
-        u.hostname.endsWith('.twimg.com') ||
-        u.hostname === 'pbs.twimg.com' ||
-        u.hostname === 'abs.twimg.com'
-      );
+      return u.hostname.endsWith('.twimg.com');
     } catch { return false; }
   }
 
@@ -316,5 +339,12 @@
       if (d < 7)  return `${d}d`;
       return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
     } catch { return ''; }
+  }
+
+  function formatCount(n) {
+    if (!n || n <= 0) return '0';
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M';
+    if (n >= 1_000)     return (n / 1_000).toFixed(1).replace(/\.0$/, '') + 'K';
+    return String(n);
   }
 })();

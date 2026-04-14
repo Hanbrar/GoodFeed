@@ -174,6 +174,22 @@
     const cell = templateCell.cloneNode(true);
     cell.dataset.goodfeedInjected = 'true';
 
+    // X's timeline is a virtualized list: each cellInnerDiv carries inline
+    // styles like `position: absolute; top: 1234px; transform: translateY(...)`
+    // that place it in a precomputed slot. If we keep those, every injected
+    // cell lands at the SAME absolute position and stacks on top of the
+    // others. Wipe positioning-related inline styles so our cells flow
+    // naturally inside the document fragment we insert before the anchor.
+    cell.style.position = '';
+    cell.style.top = '';
+    cell.style.left = '';
+    cell.style.right = '';
+    cell.style.bottom = '';
+    cell.style.transform = '';
+    cell.style.height = '';
+    cell.style.minHeight = '';
+    cell.removeAttribute('aria-rowindex');
+
     const existingArticle = cell.querySelector('article[data-testid="tweet"]');
     if (existingArticle) {
       existingArticle.replaceWith(article);
